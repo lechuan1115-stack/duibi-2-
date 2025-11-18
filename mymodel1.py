@@ -162,6 +162,8 @@ class CNNTransformerNet(PerturbBranchMixin, nn.Module):
                  nhead: int = 4, num_encoder_layers: int = 4,
                  dim_feedforward: int = 512, dropout: float = 0.1):
         super().__init__()
+        # CNN-Transformer 不参与扰动损失，保持纯分类训练
+        self.disable_perturb_loss = True
         self.first = nn.Sequential(
             nn.Conv2d(2, 32, kernel_size=(1, 5), padding=(0, 2), bias=False),
             nn.BatchNorm2d(32),
