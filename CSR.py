@@ -31,6 +31,7 @@ from perturb_utils import (
     normalize_perturb_params,
     stratified_split_indices,
     summarize_perturb_metrics,
+    set_all_seeds,
 )
 
 
@@ -634,9 +635,7 @@ def main():
         # 设置GPU与随机种子
         os.environ['CUDA_VISIBLE_DEVICES'] = cfg.gpu
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        torch.manual_seed(cfg.seed)
-        if device.type == 'cuda':
-            torch.cuda.manual_seed_all(cfg.seed)
+        set_all_seeds(cfg.seed)
 
         # 执行训练
         run(cfg, device)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
 """辅助工具：扰动范围、归一化与分层划分。"""
+import random
 from collections import defaultdict
 from typing import Tuple
 
@@ -17,6 +18,15 @@ PERTURB_RANGES = {
 }
 
 DEFAULT_SPLIT_SEED = 42
+
+
+def set_all_seeds(seed: int) -> None:
+    """同时固定 random / numpy / torch 的随机种子。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _range_tensors(signal_length: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
