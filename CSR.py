@@ -26,6 +26,13 @@ import matplotlib.pyplot as plt
 
 import mydata_read                     # ← 用你的严格读取函数
 import mymodel1                        # ← 只保留 PerturbAwareNet
+from perturb_utils import (
+    DEFAULT_SPLIT_SEED,
+    normalize_perturb_params,
+    stratified_split_indices,
+    summarize_perturb_metrics,
+    set_all_seeds,
+)
 
 
 
@@ -96,6 +103,8 @@ def _mixup(x, y, alpha=0.0):
 def _model_supports_perturb_heads(model):
     """检查模型是否实现了扰动辅助分支需要的属性。"""
     required_attrs = ["_x_as_32ch", "_perturb_reducer", "z_head", "s_head"]
+    if getattr(model, "disable_perturb_loss", False):
+        return False
     return all(hasattr(model, attr) for attr in required_attrs)
 
 
@@ -205,7 +214,7 @@ def _unpack_model_outputs(output):
     return output, None, None, None
 
 
-def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx, s_mu=None, s_std=None):
+def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx):
     model.train()
     ce = nn.CrossEntropyLoss()
     bce = nn.BCEWithLogitsLoss()
@@ -243,17 +252,16 @@ def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx, s_mu=None,
             loss_z = bce(z_logit, z) * float(cfg.lambda_z)
 
         # —— 关键改动：对 s 做按维标准化再回归 —— #
-        if s_pred is not None and has_perturb_heads:
-            m = (z > 0.5)  # 仅在 z=1 的位置监督 s
-            if lambda_s_eff > 0 and m.any():
-                if (s_mu is not None) and (s_std is not None):
-                    # 广播到 [B,D]
-                    s_pred_n = (s_pred - s_mu) / s_std
-                    s_true_n = (s      - s_mu) / s_std
-                else:
-                    # 兜底：未提供统计量时，直接用原尺度（不建议）
-                    s_pred_n, s_true_n = s_pred, s
-                loss_s = reg(s_pred_n[m], s_true_n[m]) * lambda_s_eff
+        if s_pred is not None and has_perturb_heads and lambda_s_eff > 0:
+            m = (z > 0.5).float()  # 仅在 z=1 的位置监督 s
+            active = m.sum()
+            if active > 0:
+                s_pred_n, s_true_n = normalize_perturb_params(
+                    s_pred, s, signal_length=x.size(-1)
+                )
+                per_elem = F.smooth_l1_loss(s_pred_n, s_true_n, reduction="none")
+                loss_s = (per_elem * m).sum() / active
+                loss_s = loss_s * lambda_s_eff
             else:
                 loss_s = torch.tensor(0.0, device=device)
         else:
@@ -310,6 +318,43 @@ def evaluate(model, loader, device, cfg):
         pred = logits.argmax(1)
         correct += (pred == y).sum().item(); total += y.size(0)
     return 100.0 * correct / max(1, total), losses.avg
+
+
+@torch.no_grad()
+def evaluate_perturb_metrics(model, loader, device, cfg):
+    model.eval()
+    z_acc_meter = AverageMeter()
+    mae_meter = AverageMeter()
+    mse_meter = AverageMeter()
+    for batch in loader:
+        x, _, z_true, s_true = batch
+        x = x.to(device)
+        z_true = z_true.to(device)
+        s_true = s_true.to(device)
+        z_logit, s_pred = None, None
+        if _model_supports_perturb_heads(model):
+            red_fn = getattr(model, "_x_as_32ch")
+            reducer = getattr(model, "_perturb_reducer")
+            z_head = getattr(model, "z_head")
+            s_head = getattr(model, "s_head")
+            red = reducer(red_fn(x))
+            red = red.view(red.size(0), -1)
+            z_logit = z_head(red)
+            s_pred = s_head(red)
+
+        if z_logit is None or s_pred is None:
+            continue
+        z_acc, mae, mse = summarize_perturb_metrics(z_true, s_true, z_logit, s_pred, cfg.z_thresh)
+        bs = z_true.size(0)
+        z_acc_meter.update(z_acc, bs)
+        if not np.isnan(mae):
+            mae_meter.update(mae, int((z_true > 0.5).sum().item()))
+            mse_meter.update(mse, int((z_true > 0.5).sum().item()))
+    return {
+        "z_acc": z_acc_meter.avg if z_acc_meter.count else float("nan"),
+        "s_mae": mae_meter.avg if mae_meter.count else float("nan"),
+        "s_mse": mse_meter.avg if mse_meter.count else float("nan"),
+    }
 
 
 @torch.no_grad()
@@ -374,6 +419,7 @@ def run(cfg, device):
     print(f"保存目录：{cfg.save_root}")
     print(f"模型：{cfg.model_name}")
     os.makedirs(cfg.save_root, exist_ok=True)
+    cfg.split_seed = cfg.split_seed if cfg.split_seed is not None else DEFAULT_SPLIT_SEED
 
     # 1) 读取数据（严格匹配你生成的数据结构）
     X, Y, Z, S, fs, snr_db, noise_var, order = mydata_read.load_adsb_aug5_strict(cfg.data, shuffle=False, seed=cfg.seed)
@@ -385,42 +431,13 @@ def run(cfg, device):
 
     # 2) 分层划分 80/10/10
     # 2) 分层随机划分（Stratified Random Split）
-    from collections import defaultdict
-    by_cls = defaultdict(list)
-    for i, y in enumerate(Y.tolist()):
-        by_cls[y].append(i)
-
-    # 随机种子：None 则每次不同；否则可复现
-    import time
-    _used_seed = cfg.split_seed if cfg.split_seed is not None else (int(time.time() * 1000) % (2 ** 32 - 1))
-    rng = np.random.RandomState(_used_seed)
-
-    tr, va, te = [], [], []
     val_ratio = float(getattr(cfg, "val_ratio", 0.10))
     test_ratio = float(getattr(cfg, "test_ratio", 0.10))
     assert 0 < val_ratio < 1 and 0 < test_ratio < 1 and (val_ratio + test_ratio) < 1, "val/test 比例不合法"
 
-    for c, ids in by_cls.items():
-        ids = np.array(ids)
-        rng.shuffle(ids)
-        n = len(ids)
-
-        n_va = int(round(val_ratio * n))
-        n_te = int(round(test_ratio * n))
-        n_tr = n - n_va - n_te
-
-        # 防止某类过小导致某个集合为 0
-        if n >= 3:
-            n_tr = max(n_tr, 1)
-            n_va = max(n_va, 1)
-            n_te = max(n - n_tr - n_va, 1)
-        # 切分
-        cut1 = n_tr
-        cut2 = n_tr + n_va
-        tr.extend(ids[:cut1])
-        va.extend(ids[cut1:cut2])
-        te.extend(ids[cut2:])
-
+    tr, va, te, _used_seed = stratified_split_indices(
+        Y, val_ratio=val_ratio, test_ratio=test_ratio, split_seed=cfg.split_seed
+    )
     print(f"[SPLIT] seed={_used_seed}  sizes: train={len(tr)}  val={len(va)}  test={len(te)}")
     # 互斥检查
     st_tr, st_va, st_te = set(tr), set(va), set(te)
@@ -463,9 +480,6 @@ def run(cfg, device):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
 
-    # —— 新增：计算 s 的按维归一化统计量（仅 z=1 的位置） —— #
-    s_mu, s_std = compute_s_norm_stats(trainloader, device)
-
     # 4) 训练循环
     history = []
     best_val = -1e9
@@ -486,7 +500,7 @@ def run(cfg, device):
 
         a_tr, l_tr = train_one_epoch(
             model, optimizer, trainloader, device, cfg,
-            epoch_idx=epoch, s_mu=s_mu, s_std=s_std
+            epoch_idx=epoch
         )
 
         a_va, l_va = evaluate(model, valloader, device, cfg)
@@ -525,22 +539,45 @@ def run(cfg, device):
     model.load_state_dict(torch.load(ckpt, map_location=device))
     acc_val, _ = evaluate(model, valloader, device, cfg)
     test_stats = test_and_visualize(model, testloader, device, cfg, save_dir=cfg.save_root)
+    perturb_stats = evaluate_perturb_metrics(model, testloader, device, cfg)
 
     # 曲线
     plot_curves(history, osp.join(cfg.save_root, "train_val_curves.png"))
 
     # 写 CSV/JSON
-    metrics = dict(val_acc=float(acc_val), test_top1=float(test_stats['top1']), train_time_sec=float(elapsed))
+    metrics = dict(
+        val_acc=float(acc_val),
+        test_top1=float(test_stats['top1']),
+        test_z_acc=float(perturb_stats.get("z_acc", float("nan"))),
+        test_s_mae=float(perturb_stats.get("s_mae", float("nan"))),
+        test_s_mse=float(perturb_stats.get("s_mse", float("nan"))),
+        train_time_sec=float(elapsed),
+    )
     csv_path = osp.join(cfg.save_root, "summary.csv")
     write_header = (not osp.exists(csv_path))
     with open(csv_path, "a", newline='', encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["val_acc", "test_top1", "train_time_sec", "timestamp"])
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "val_acc",
+                "test_top1",
+                "test_z_acc",
+                "test_s_mae",
+                "test_s_mse",
+                "train_time_sec",
+                "timestamp",
+            ],
+        )
         if write_header: w.writeheader()
         w.writerow({**metrics, "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
     with open(osp.join(cfg.save_root, "summary.json"), "w", encoding="utf-8") as f:
         json.dump({"metrics": metrics, "history": history}, f, ensure_ascii=False, indent=2)
 
-    print(f"Val_Acc: {metrics['val_acc']:.2f}%  TestTop1: {metrics['test_top1']:.2f}%")
+    print(
+        f"Val_Acc: {metrics['val_acc']:.2f}%  TestTop1: {metrics['test_top1']:.2f}%  "
+        f"TestZ_Acc: {metrics['test_z_acc']:.4f}  TestS_MAE: {metrics['test_s_mae']:.4f}  "
+        f"TestS_MSE: {metrics['test_s_mse']:.4f}"
+    )
     print("[DONE] 结果已写入：", cfg.save_root)
 
 
@@ -573,7 +610,7 @@ def main():
         print_freq=10,
         val_ratio=0.10,
         test_ratio=0.10,
-        split_seed=None,
+        split_seed=DEFAULT_SPLIT_SEED,
         save_split=True,
         early_stop=True,
         es_metric="val_acc",
@@ -582,7 +619,7 @@ def main():
         es_patience=8,
         es_warmup=5,
         lambda_z=1.0,
-        lambda_s=1e-3,
+        lambda_s=1.0,
         s_warmup_epochs=5,
         use_gt_zs_train=True,
         use_gt_zs_eval=False,
@@ -601,18 +638,12 @@ def main():
         # 设置GPU与随机种子
         os.environ['CUDA_VISIBLE_DEVICES'] = cfg.gpu
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        torch.manual_seed(cfg.seed)
-        if device.type == 'cuda':
-            torch.cuda.manual_seed_all(cfg.seed)
+        set_all_seeds(cfg.seed)
 
         # 执行训练
         run(cfg, device)
 
     print("\n 所有模型训练完成！")
-
-
-
-    run(cfg, device)
 
 
 if __name__ == '__main__':
