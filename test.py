@@ -250,13 +250,16 @@ def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx):
             loss_z = bce(z_logit, z) * float(cfg.lambda_z)
 
         # —— 关键改动：对 s 做按维标准化再回归 —— #
-        if s_pred is not None and has_perturb_heads:
-            m = (z > 0.5)  # 仅在 z=1 的位置监督 s
-            if lambda_s_eff > 0 and m.any():
+        if s_pred is not None and has_perturb_heads and lambda_s_eff > 0:
+            m = (z > 0.5).float()  # 仅在 z=1 的位置监督 s
+            active = m.sum()
+            if active > 0:
                 s_pred_n, s_true_n = normalize_perturb_params(
                     s_pred, s, signal_length=x.size(-1)
                 )
-                loss_s = reg(s_pred_n[m], s_true_n[m]) * lambda_s_eff
+                per_elem = F.smooth_l1_loss(s_pred_n, s_true_n, reduction="none")
+                loss_s = (per_elem * m).sum() / active
+                loss_s = loss_s * lambda_s_eff
             else:
                 loss_s = torch.tensor(0.0, device=device)
         else:
@@ -313,6 +316,43 @@ def evaluate(model, loader, device, cfg):
         pred = logits.argmax(1)
         correct += (pred == y).sum().item(); total += y.size(0)
     return 100.0 * correct / max(1, total), losses.avg
+
+
+@torch.no_grad()
+def evaluate_perturb_metrics(model, loader, device, cfg):
+    model.eval()
+    z_acc_meter = AverageMeter()
+    mae_meter = AverageMeter()
+    mse_meter = AverageMeter()
+    for batch in loader:
+        x, _, z_true, s_true = batch
+        x = x.to(device)
+        z_true = z_true.to(device)
+        s_true = s_true.to(device)
+        z_logit, s_pred = None, None
+        if _model_supports_perturb_heads(model):
+            red_fn = getattr(model, "_x_as_32ch")
+            reducer = getattr(model, "_perturb_reducer")
+            z_head = getattr(model, "z_head")
+            s_head = getattr(model, "s_head")
+            red = reducer(red_fn(x))
+            red = red.view(red.size(0), -1)
+            z_logit = z_head(red)
+            s_pred = s_head(red)
+
+        if z_logit is None or s_pred is None:
+            continue
+        z_acc, mae, mse = summarize_perturb_metrics(z_true, s_true, z_logit, s_pred, cfg.z_thresh)
+        bs = z_true.size(0)
+        z_acc_meter.update(z_acc, bs)
+        if not np.isnan(mae):
+            mae_meter.update(mae, int((z_true > 0.5).sum().item()))
+            mse_meter.update(mse, int((z_true > 0.5).sum().item()))
+    return {
+        "z_acc": z_acc_meter.avg if z_acc_meter.count else float("nan"),
+        "s_mae": mae_meter.avg if mae_meter.count else float("nan"),
+        "s_mse": mse_meter.avg if mse_meter.count else float("nan"),
+    }
 
 
 @torch.no_grad()
